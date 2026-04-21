@@ -820,6 +820,18 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
     def async_generate_sequences(self, *args, **kwargs):
         return self.generate_sequences(*args, **kwargs)
 
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
+    async def wake_up(self):
+        return True
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
+    async def sleep(self):
+        return True
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
+    def get_zeromq_address(self):
+        return self.rollout.get_zeromq_address()
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def create_weight_sync_group(self, master_address, master_port, rank_offset, world_size):
         rank = torch.distributed.get_rank() + rank_offset
