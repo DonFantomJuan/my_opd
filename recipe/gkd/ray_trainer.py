@@ -189,6 +189,17 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         self._async_rollout_executor = None
         self.async_rollout_manager = None
 
+    def _build_async_rollout_manager_config(self):
+        manager_config = OmegaConf.create(OmegaConf.to_container(self.config, resolve=False))
+        if OmegaConf.select(manager_config, "reward_model") is None:
+            manager_config.reward_model = OmegaConf.create(
+                {
+                    "enable": False,
+                    "enable_resource_pool": False,
+                }
+            )
+        return manager_config
+
     def _build_teacher_specs(self, teacher_config):
         teachers = OmegaConf.select(teacher_config, "teachers")
         if not teachers:
@@ -393,7 +404,7 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
             from recipe.one_step_off_policy.agent_loop import OneStepOffAgentLoopManager
 
             self.async_rollout_manager = OneStepOffAgentLoopManager(
-                config=self.config,
+                config=self._build_async_rollout_manager_config(),
                 worker_group=self.rollout_wg,
             )
             self._async_rollout_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
