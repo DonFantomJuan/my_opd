@@ -61,6 +61,23 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def get_vllm_inference_model(rollout):
+    inference_engine = getattr(rollout, "inference_engine", None)
+    if inference_engine is None:
+        return None
+
+    if hasattr(inference_engine, "worker"):
+        return inference_engine.worker.model_runner.model
+
+    if hasattr(inference_engine, "llm_engine"):
+        return inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+
+    raise AttributeError(
+        f"Unsupported inference_engine type: {type(inference_engine)}. "
+        "Expected worker.model_runner.model or llm_engine.model_executor.driver_worker.worker.model_runner.model."
+    )
+
+
 class TensorBuffer:
     def __init__(self, memory_alloc, dtype):
         device = get_device_id()
@@ -838,7 +855,7 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
         sequences and optionally fetches teacher knowledge, and returns DataProto.
         """
         assert self._is_rollout and not self._is_actor
-        prompts.batch = prompts.batch.to(get_device_name())
+        prompts = prompts.to(get_device_name())
         meta_info = {
             "eos_token_id": self.generation_config.eos_token_id
             if self.generation_config is not None
@@ -888,9 +905,10 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
         assert hasattr(self, "_weights_info") and self._weights_info is not None
         rollout_name = self.config.rollout.name
         if rollout_name == "vllm":
-            inference_model = (
-                self.rollout.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
-            )
+            inference_model = get_vllm_inference_model(self.rollout)
+            if inference_model is None:
+                logger.warning("Skip rollout weight sync because vLLM inference engine is not initialized yet.")
+                return
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 
             patch_vllm_moe_model_weight_loader(inference_model)

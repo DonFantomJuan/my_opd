@@ -31,6 +31,7 @@ from tqdm import tqdm
 
 from recipe.gkd.teacher_utils import TeacherManager, get_teacher_knowledge
 from verl import DataProto
+from verl.experimental.agent_loop import AgentLoopManager
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
@@ -168,6 +169,7 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         self.teacher_config = self.config.actor_rollout_ref.teacher
         self.teacher_manager = TeacherManager(self.teacher_config)
         self.n_server_workers = self.teacher_manager.default_n_server_workers
+        self.async_rollout_mode = self.config.actor_rollout_ref.rollout.mode == "async"
 
         self.params_dtype = PrecisionType.to_dtype("bfloat16")
 
@@ -311,6 +313,15 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         weights_info = self.actor_wg.get_actor_weights_info()[0]
         self.rollout_wg.set_actor_weights_info(weights_info)
         self._create_weight_sync_group()
+        if self.async_rollout_mode:
+            self._init_async_rollout_manager()
+
+    def _init_async_rollout_manager(self):
+        self.async_rollout_manager = AgentLoopManager(
+            config=self.config,
+            worker_group=self.rollout_wg,
+            rm_resource_pool=None,
+        )
 
     def _create_weight_sync_group(self):
         from ray.util.collective import collective
@@ -364,8 +375,10 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         """
         batch = DataProto.from_single_dict(batch_dict)
         # pop those keys for generation
-        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-        non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+        batch_keys_to_pop = [key for key in ["input_ids", "attention_mask", "position_ids"] if key in batch.batch]
+        if not batch_keys_to_pop and batch.batch is not None and "dummy_tensor" in batch.batch.keys():
+            batch_keys_to_pop = ["dummy_tensor"]
+        non_tensor_batch_keys_to_pop = [key for key in ["raw_prompt_ids"] if key in batch.non_tensor_batch]
         if "multi_modal_data" in batch.non_tensor_batch:
             non_tensor_batch_keys_to_pop.append("multi_modal_data")
         if "raw_prompt" in batch.non_tensor_batch:
@@ -382,8 +395,11 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         # sync weights from actor to rollout
         if sync_before_generation:
             self.sync_rollout_weights()
-        # Call non-blocking rollout (worker method registered with blocking=False)
-        gen_batch_output = self.rollout_wg.async_generate_sequences(gen_batch)
+        if self.async_rollout_mode:
+            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+        else:
+            # Call non-blocking rollout (worker method registered with blocking=False)
+            gen_batch_output = self.rollout_wg.async_generate_sequences(gen_batch)
         return GenerationBatchFuture(epoch, batch, gen_batch_output)
 
     def _async_get_teacher_knowledge(self, future: GenerationBatchFuture):
