@@ -307,9 +307,14 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         self.rollout_wg = all_wg["rollout"]
         self.actor_wg = all_wg["actor"]
 
-        # Initialize both groups
+        # Initialize rollout first so async server actors are scheduled before actor workers
+        # push node memory close to Ray's OOM killer threshold.
         print("[GKD] init_workers: rollout_wg.init_model()", flush=True)
         self.rollout_wg.init_model()
+        if self.async_rollout_mode:
+            print("[GKD] init_workers: init async rollout manager", flush=True)
+            self._init_async_rollout_manager()
+
         print("[GKD] init_workers: actor_wg.init_model()", flush=True)
         self.actor_wg.init_model()
         self.actor_rollout_wg = self.actor_wg  # to be compatible with the functions that not be modified
@@ -317,9 +322,6 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         self.rollout_wg.set_actor_weights_info(weights_info)
         print("[GKD] init_workers: create weight sync group", flush=True)
         self._create_weight_sync_group()
-        if self.async_rollout_mode:
-            print("[GKD] init_workers: init async rollout manager", flush=True)
-            self._init_async_rollout_manager()
 
     def _init_async_rollout_manager(self):
         from recipe.one_step_off_policy.agent_loop import OneStepOffAgentLoopManager
