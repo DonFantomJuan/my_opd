@@ -58,6 +58,7 @@ def run_on_policy_distill(config) -> None:
                 model paths, and training hyperparameters.
     """
     _ensure_stable_cwd()
+    print("[GKD] Enter run_on_policy_distill", flush=True)
     if not ray.is_initialized():
         default_runtime_env = get_ppo_ray_runtime_env()
         runtime_env = OmegaConf.merge(
@@ -70,7 +71,11 @@ def run_on_policy_distill(config) -> None:
                 }
             ),
         )
+        print("[GKD] Calling ray.init", flush=True)
         ray.init(runtime_env=OmegaConf.to_container(runtime_env, resolve=True), num_cpus=config.ray_init.num_cpus)
+        print("[GKD] ray.init finished", flush=True)
+    else:
+        print("[GKD] Ray already initialized", flush=True)
 
     # Create a remote instance of the TaskRunner class, and
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
@@ -85,7 +90,9 @@ def run_on_policy_distill(config) -> None:
         runner = TaskRunner.options(runtime_env={"nsight": nsight_options}).remote()
     else:
         runner = TaskRunner.remote()
+    print("[GKD] TaskRunner actor created, submitting run()", flush=True)
     ray.get(runner.run.remote(config))
+    print("[GKD] TaskRunner.run() finished", flush=True)
 
     # [Optional] get the path of the timeline trace file from the configuration, default to None
     # This file is used for performance analysis
@@ -120,23 +127,26 @@ class TaskRunner:
         from verl.utils.fs import copy_to_local
 
         _ensure_stable_cwd()
-        print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
+        print(f"[GKD] TaskRunner.run entered on {socket.gethostname()}, PID: {os.getpid()}", flush=True)
 
         pprint(OmegaConf.to_container(config, resolve=True))
 
         OmegaConf.resolve(config)
+        print("[GKD] Config resolved", flush=True)
 
         # Download the checkpoint from HDFS to the local machine.
         # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
         local_path = copy_to_local(
             config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
         )
+        print(f"[GKD] Model copied to local path: {local_path}", flush=True)
 
         # Instantiate the tokenizer and processor.
         from verl.utils import hf_tokenizer
 
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        print("[GKD] Tokenizer initialized", flush=True)
 
         # Version validation for vllm.
         if config.actor_rollout_ref.rollout.name in ["vllm"]:
@@ -192,17 +202,20 @@ class TaskRunner:
         print(f"resource_pool_spec: {resource_pool_spec}")
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+        print(f"[GKD] ResourcePoolManager created: {resource_pool_spec}", flush=True)
 
         from verl.trainer.main_ppo import create_rl_sampler
         from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 
         # Create training and validation datasets.
         train_dataset = RLHFDataset(config.data.train_files, tokenizer, config.data, None)
+        print("[GKD] Train dataset initialized", flush=True)
 
         if config.data.val_files:
             val_dataset = RLHFDataset(config.data.val_files, tokenizer, config.data, None)
         else:
             val_dataset = None
+        print("[GKD] Validation dataset initialized", flush=True)
 
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
@@ -219,10 +232,15 @@ class TaskRunner:
             train_sampler=train_sampler,
             device_name=config.trainer.device,
         )
+        print("[GKD] Trainer initialized", flush=True)
         # Initialize the workers of the trainer.
+        print("[GKD] Calling trainer.init_workers()", flush=True)
         trainer.init_workers()
+        print("[GKD] trainer.init_workers() finished", flush=True)
         # Start the training process.
+        print("[GKD] Calling trainer.fit()", flush=True)
         trainer.fit()
+        print("[GKD] trainer.fit() finished", flush=True)
 
 
 if __name__ == "__main__":

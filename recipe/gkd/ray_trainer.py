@@ -267,6 +267,7 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         1. Ray resource pools from configuration
         2. Worker groups for each role (actor, critic, etc.)
         """
+        print("[GKD] init_workers: create resource pools", flush=True)
         self.resource_pool_manager.create_resource_pool()
 
         # Build Ray classes per pool
@@ -324,13 +325,17 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         self.actor_wg = all_wg["actor"]
 
         # Initialize both groups
+        print("[GKD] init_workers: rollout_wg.init_model()", flush=True)
         self.rollout_wg.init_model()
+        print("[GKD] init_workers: actor_wg.init_model()", flush=True)
         self.actor_wg.init_model()
         self.actor_rollout_wg = self.actor_wg  # to be compatible with the functions that not be modified
         weights_info = self.actor_wg.get_actor_weights_info()[0]
         self.rollout_wg.set_actor_weights_info(weights_info)
+        print("[GKD] init_workers: create weight sync group", flush=True)
         self._create_weight_sync_group()
         if self.async_rollout_mode:
+            print("[GKD] init_workers: init async rollout manager", flush=True)
             self._init_async_rollout_manager()
 
     def _init_async_rollout_manager(self):
