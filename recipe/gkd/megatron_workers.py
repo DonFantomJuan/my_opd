@@ -78,6 +78,10 @@ def get_vllm_inference_model(rollout):
     )
 
 
+def is_vllm_engine_initialized(rollout):
+    return getattr(rollout, "inference_engine", None) is not None
+
+
 class TensorBuffer:
     def __init__(self, memory_alloc, dtype):
         device = get_device_id()
@@ -885,6 +889,40 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"), blocking=False)
     def async_generate_sequences(self, *args, **kwargs):
         return self.generate_sequences(*args, **kwargs)
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
+    async def wake_up(self):
+        if self.config.rollout.name == "vllm" and not is_vllm_engine_initialized(self.rollout):
+            logger.warning("Skip rollout wake_up because vLLM inference engine is not initialized yet.")
+            return True
+        if self.config.rollout.free_cache_engine:
+            await self.rollout.resume(tags=["weights", "kv_cache"])
+        return True
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
+    async def sleep(self):
+        if self.config.rollout.name == "vllm" and not is_vllm_engine_initialized(self.rollout):
+            logger.warning("Skip rollout sleep because vLLM inference engine is not initialized yet.")
+            return True
+        if self.config.rollout.free_cache_engine:
+            await self.rollout.release()
+        return True
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
+    def get_zeromq_address(self):
+        if self.config.rollout.name == "vllm" and not is_vllm_engine_initialized(self.rollout):
+            raise RuntimeError("vLLM inference engine is not initialized; zeromq address is unavailable.")
+        return self.rollout.get_zeromq_address()
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
+    async def chat_completion(self, json_request):
+        ret = await self.rollout.chat_completion(json_request)
+        return ret
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
+    async def generate(self, prompt_ids, sampling_params, request_id, image_data=None):
+        ret = await self.rollout.generate(prompt_ids, sampling_params, request_id, image_data=image_data)
+        return ret
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def create_weight_sync_group(self, master_address, master_port, rank_offset, world_size):
