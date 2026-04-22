@@ -278,12 +278,31 @@ actor_rollout_ref:
 
     # [Experimental] agent loop based rollout configs
     agent:
+      _target_: verl.workers.config.AgentLoopConfig
       # Number of agent loop workers
       num_workers: 8
+      default_agent_loop: single_turn_agent
+      agent_loop_config_path: null
       custom_async_server:
+        _target_: verl.workers.config.CustomAsyncServerConfig
         path: null
         name: null
     update_weights_bucket_megabytes: 512
+    trace:
+      _target_: verl.workers.config.TraceConfig
+      backend: null
+      token2text: False
+      max_samples_per_step_per_worker: null
+    skip_rollout: False
+    skip_dump_dir: /tmp/rollout_dump
+    skip_tokenizer_init: True
+    enable_rollout_routing_replay: False
+    prometheus:
+      _target_: verl.workers.config.PrometheusConfig
+      enable: False
+      port: 9090
+      file: /tmp/ray/session_latest/metrics/prometheus/prometheus.yml
+      served_model_name: ${oc.select:actor_rollout_ref.model.path,null}
     # support logging rollout prob for debugging purpose
     calculate_log_probs: False
     # # Nsight system profiler configs
@@ -341,6 +360,42 @@ trainer:
 rollout:
   nnodes: 1
   n_gpus_per_node: 4
+
+reward_model:
+  enable: False
+  enable_resource_pool: False
+  n_gpus_per_node: 0
+  nnodes: 0
+  strategy: fsdp
+  model:
+    input_tokenizer: ${actor_rollout_ref.model.path}
+    path: ${actor_rollout_ref.model.path}
+    external_lib: ${actor_rollout_ref.model.external_lib}
+    trust_remote_code: False
+    override_config: {}
+  micro_batch_size: null
+  micro_batch_size_per_gpu: null
+  max_length: null
+  use_dynamic_bsz: False
+  forward_max_token_len_per_gpu: null
+  reward_manager: naive
+  reward_loop_source: register
+  reward_loop_module_path: null
+  reward_loop_class_name: null
+  use_reward_loop: False
+  launch_reward_fn_async: False
+  sandbox_fusion:
+    url: null
+    max_concurrent: 64
+    memory_limit_mb: 1024
+  profiler:
+    _target_: verl.utils.profiler.ProfilerConfig
+    tool: ${oc.select:global_profiler.tool,null}
+    enable: False
+    all_ranks: False
+    ranks: []
+    save_path: ${oc.select:global_profiler.save_path,null}
+    tool_config: ${oc.select:actor_rollout_ref.actor.profiler.tool_config,null}
 
 ray_init:
   num_cpus: null # `None` means using all CPUs, which might cause hang if limited in systems like SLURM. Please set to a number allowed then.
