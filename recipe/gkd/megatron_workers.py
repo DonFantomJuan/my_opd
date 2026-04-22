@@ -920,8 +920,23 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
         return ret
 
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
-    async def generate(self, prompt_ids, sampling_params, request_id, image_data=None):
-        ret = await self.rollout.generate(prompt_ids, sampling_params, request_id, image_data=image_data)
+    async def generate(
+        self,
+        prompt_ids,
+        sampling_params,
+        request_id,
+        image_data=None,
+        video_data=None,
+        **kwargs,
+    ):
+        ret = await self.rollout.generate(
+            prompt_ids,
+            sampling_params,
+            request_id,
+            image_data=image_data,
+            video_data=video_data,
+            **kwargs,
+        )
         return ret
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
