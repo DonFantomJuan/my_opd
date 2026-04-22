@@ -18,6 +18,7 @@ FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import asyncio
 import time
 from typing import Optional
 
@@ -31,7 +32,6 @@ from tqdm import tqdm
 
 from recipe.gkd.teacher_utils import TeacherManager, get_teacher_knowledge
 from verl import DataProto
-from verl.experimental.agent_loop import AgentLoopManager
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
@@ -50,23 +50,6 @@ from verl.utils.torch_dtypes import PrecisionType
 from verl.utils.tracking import ValidationGenerationsLogger
 
 WorkerType = type[Worker]
-
-
-class GKDAgentLoopManager(AgentLoopManager):
-    def _initialize_llm_servers(self):
-        assert self.worker_group is not None, "GKD async rollout manager requires an existing rollout worker group"
-        self.rollout_replicas = []
-        self.server_handles = list(self.worker_group.workers)
-        self.server_addresses = []
-
-    def wake_up(self):
-        ray.get([worker.wake_up.remote() for worker in self.server_handles])
-
-    def sleep(self):
-        ray.get([worker.sleep.remote() for worker in self.server_handles])
-
-    def clear_kv_cache(self):
-        return None
 
 
 class GenerationBatchFuture:
@@ -339,12 +322,14 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
             self._init_async_rollout_manager()
 
     def _init_async_rollout_manager(self):
+        from recipe.one_step_off_policy.agent_loop import OneStepOffAgentLoopManager
+
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
             try:
                 ray.get(self.rollout_wg.sleep())
             except Exception as e:
                 print(f"Warning: failed to pre-sleep rollout workers before async server init: {e}")
-        self.async_rollout_manager = GKDAgentLoopManager(
+        self.async_rollout_manager = OneStepOffAgentLoopManager(
             config=self.config,
             worker_group=self.rollout_wg,
             rm_resource_pool=None,
@@ -386,6 +371,11 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         assert not self.hybrid_engine
         self.actor_wg.sync_rollout_weights()
         ray.get(self.rollout_wg.sync_rollout_weights())
+        if self.async_rollout_mode and hasattr(self, "async_rollout_manager"):
+            try:
+                asyncio.run(self.async_rollout_manager.clear_kv_cache())
+            except Exception as e:
+                print(f"Warning: failed to clear async rollout kv cache after weight sync: {e}")
 
     def _create_continuous_iterator(self):
         """
@@ -423,7 +413,7 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         if sync_before_generation:
             self.sync_rollout_weights()
         if self.async_rollout_mode:
-            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+            gen_batch_output = asyncio.run(self.async_rollout_manager.generate_sequences_async(gen_batch))
         else:
             # Call non-blocking rollout (worker method registered with blocking=False)
             gen_batch_output = self.rollout_wg.async_generate_sequences(gen_batch)
