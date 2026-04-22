@@ -60,6 +60,8 @@ actor_rollout_ref:
     # Whether to automatically adjust batch size at runtime
     strategy: megatron
     micro_batch_size: 2
+    # Keep compatibility with legacy Megatron launch overrides used by the existing OPD scripts.
+    ppo_mini_batch_size: ${actor_rollout_ref.actor.micro_batch_size}
     megatron:
       param_offload: False
       grad_offload: False
@@ -115,6 +117,7 @@ actor_rollout_ref:
       load_contents: ${actor_rollout_ref.actor.checkpoint.save_contents}
     use_dynamic_bsz: False
     max_token_len: 1024
+    ppo_max_token_len_per_gpu: null
     use_torch_compile: False
     shuffle: False
     # profile the actor model in `update_policy` 
@@ -204,6 +207,8 @@ actor_rollout_ref:
     max_num_seqs: 1024
     disable_log_stats: True
     enable_chunked_prefill: False # could get higher throughput
+    log_prob_use_dynamic_bsz: False
+    log_prob_max_token_len_per_gpu: null
     # for hf rollout
     do_sample: True
     layer_name_map:
