@@ -916,7 +916,10 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
 
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
     async def chat_completion(self, json_request):
-        ret = await self.rollout.chat_completion(json_request)
+        if hasattr(self.rollout, "_execute_method"):
+            ret = await self.rollout._execute_method("chat_completion", json_request)
+        else:
+            ret = await self.rollout.chat_completion(json_request)
         return ret
 
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
@@ -929,14 +932,25 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
         video_data=None,
         **kwargs,
     ):
-        ret = await self.rollout.generate(
-            prompt_ids,
-            sampling_params,
-            request_id,
-            image_data=image_data,
-            video_data=video_data,
-            **kwargs,
-        )
+        if hasattr(self.rollout, "_execute_method"):
+            ret = await self.rollout._execute_method(
+                "generate",
+                prompt_ids,
+                sampling_params,
+                request_id,
+                image_data=image_data,
+                video_data=video_data,
+                **kwargs,
+            )
+        else:
+            ret = await self.rollout.generate(
+                prompt_ids,
+                sampling_params,
+                request_id,
+                image_data=image_data,
+                video_data=video_data,
+                **kwargs,
+            )
         return ret
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
