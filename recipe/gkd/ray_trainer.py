@@ -52,6 +52,23 @@ from verl.utils.tracking import ValidationGenerationsLogger
 WorkerType = type[Worker]
 
 
+class GKDAgentLoopManager(AgentLoopManager):
+    def _initialize_llm_servers(self):
+        assert self.worker_group is not None, "GKD async rollout manager requires an existing rollout worker group"
+        self.rollout_replicas = []
+        self.server_handles = list(self.worker_group.workers)
+        self.server_addresses = []
+
+    def wake_up(self):
+        ray.get([worker.wake_up.remote() for worker in self.server_handles])
+
+    def sleep(self):
+        ray.get([worker.sleep.remote() for worker in self.server_handles])
+
+    def clear_kv_cache(self):
+        return None
+
+
 class GenerationBatchFuture:
     """
     Wrapper class for encapsulating batch generation results
@@ -317,7 +334,12 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
             self._init_async_rollout_manager()
 
     def _init_async_rollout_manager(self):
-        self.async_rollout_manager = AgentLoopManager(
+        if self.config.actor_rollout_ref.rollout.free_cache_engine:
+            try:
+                ray.get(self.rollout_wg.sleep())
+            except Exception as e:
+                print(f"Warning: failed to pre-sleep rollout workers before async server init: {e}")
+        self.async_rollout_manager = GKDAgentLoopManager(
             config=self.config,
             worker_group=self.rollout_wg,
             rm_resource_pool=None,
