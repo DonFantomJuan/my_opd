@@ -31,7 +31,6 @@ RAY_RUNTIME_ENV = {
         "VLLM_LOGGING_LEVEL": "WARN",
         "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "false",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
         # To prevent hanging or crash during synchronization of weights between actor and rollout
         # in disaggregated mode. See:
         # https://docs.vllm.ai/en/latest/usage/troubleshooting.html?h=nccl_cumem_enable#known-issues
@@ -150,7 +149,7 @@ class TaskRunner:
         if config.actor_rollout_ref.actor.strategy == "megatron":
             from verl.single_controller.ray import RayWorkerGroup
 
-            from recipe.gkd.megatron_workers import (
+            from .megatron_workers import (
                 MegatronOnPolicyDistillActorWorker,
                 MegatronOnPolicyDistillRolloutWorker,
             )

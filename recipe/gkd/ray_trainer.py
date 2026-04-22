@@ -18,10 +18,7 @@ FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
-import asyncio
-import concurrent.futures
 import time
-from types import SimpleNamespace
 from typing import Optional
 
 import numpy as np
@@ -32,8 +29,7 @@ from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
-from recipe.gkd.teacher import TeacherClient
-from recipe.gkd.teacher_utils import fuse_teacher_knowledge, get_teacher_knowledge
+from recipe.gkd.teacher_utils import TeacherManager, get_teacher_knowledge
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.single_controller.base import Worker
@@ -48,19 +44,10 @@ from verl.utils.debug import marked_timer
 from verl.utils.metric import (
     reduce_metrics,
 )
-from verl.utils.device import get_nccl_backend
 from verl.utils.torch_dtypes import PrecisionType
 from verl.utils.tracking import ValidationGenerationsLogger
 
 WorkerType = type[Worker]
-
-
-class LocalFutureWrapper:
-    def __init__(self, future: concurrent.futures.Future):
-        self._future = future
-
-    def get(self):
-        return self._future.result()
 
 
 class GenerationBatchFuture:
@@ -178,63 +165,10 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
         self.teacher_config = self.config.actor_rollout_ref.teacher
-        self.teacher_specs = self._build_teacher_specs(self.teacher_config)
-        self.teacher_aggregation = self.teacher_config.get("aggregation", "weighted_loss")
-        assert self.teacher_aggregation in {"weighted_loss", "distribution_fusion"}, (
-            "actor_rollout_ref.teacher.aggregation must be either "
-            "'weighted_loss' or 'distribution_fusion'"
-        )
+        self.teacher_manager = TeacherManager(self.teacher_config)
+        self.n_server_workers = self.teacher_manager.default_n_server_workers
 
         self.params_dtype = PrecisionType.to_dtype("bfloat16")
-        self._async_rollout_executor = None
-        self.async_rollout_manager = None
-
-    def _build_async_rollout_manager_config(self):
-        manager_config = OmegaConf.create(OmegaConf.to_container(self.config, resolve=False))
-        if OmegaConf.select(manager_config, "reward_model") is None:
-            manager_config.reward_model = OmegaConf.create(
-                {
-                    "enable": False,
-                    "enable_resource_pool": False,
-                }
-            )
-        return manager_config
-
-    def _build_teacher_specs(self, teacher_config):
-        teachers = OmegaConf.select(teacher_config, "teachers")
-        if not teachers:
-            teachers = [
-                {
-                    "name": "teacher_0",
-                    "server_ip": teacher_config.server_ip,
-                    "server_port": teacher_config.server_port,
-                    "n_server_workers": teacher_config.n_server_workers,
-                    "weight": 1.0,
-                }
-            ]
-
-        teacher_specs = []
-        for idx, teacher in enumerate(teachers):
-            name = str(teacher.get("name", f"teacher_{idx}"))
-            safe_name = "".join(c if c.isalnum() or c == "_" else "_" for c in name)
-            assert safe_name not in {spec["name"] for spec in teacher_specs}, f"Duplicate teacher name: {safe_name}"
-            n_server_workers = int(teacher.get("n_server_workers", teacher_config.get("n_server_workers", 1)))
-            teacher_specs.append(
-                {
-                    "name": safe_name,
-                    "weight": float(teacher.get("weight", 1.0)),
-                    "n_server_workers": n_server_workers,
-                    "client": TeacherClient(
-                        teacher.get("server_ip", teacher_config.server_ip),
-                        teacher.get("server_port", teacher_config.server_port),
-                        n_server_workers=n_server_workers,
-                    ),
-                }
-            )
-
-        total_weight = sum(spec["weight"] for spec in teacher_specs)
-        assert total_weight > 0, "At least one teacher weight must be positive."
-        return teacher_specs
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -375,39 +309,16 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         self.actor_rollout_wg = self.actor_wg  # to be compatible with the functions that not be modified
         weights_info = self.actor_wg.get_actor_weights_info()[0]
         self.rollout_wg.set_actor_weights_info(weights_info)
+        from ray.util.collective import collective
+
         actor_rollout_workers = self.actor_wg.workers + self.rollout_wg.workers
-        n_workers = len(actor_rollout_workers)
-        if str(self.device_name).lower() == "npu":
-            master_address = ray.get(self.actor_wg.workers[0]._get_node_ip.remote())
-            master_port = ray.get(self.actor_wg.workers[0]._get_free_port.remote())
-            self.actor_wg.create_weight_sync_group(master_address, master_port, 0, n_workers)
-            ray.get(
-                self.rollout_wg.create_weight_sync_group(
-                    master_address,
-                    master_port,
-                    len(self.actor_wg.workers),
-                    n_workers,
-                )
-            )
-        else:
-            from ray.util.collective import collective
-
-            collective.create_collective_group(
-                actor_rollout_workers,
-                n_workers,
-                list(range(0, n_workers)),
-                backend=get_nccl_backend(),
-                group_name="actor_rollout",
-            )
-
-        if str(self.config.actor_rollout_ref.rollout.mode).lower() == "async":
-            from recipe.one_step_off_policy.agent_loop import OneStepOffAgentLoopManager
-
-            self.async_rollout_manager = OneStepOffAgentLoopManager(
-                config=self._build_async_rollout_manager_config(),
-                worker_group=self.rollout_wg,
-            )
-            self._async_rollout_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        collective.create_collective_group(
+            actor_rollout_workers,
+            len(actor_rollout_workers),
+            list(range(0, len(actor_rollout_workers))),
+            backend="nccl",
+            group_name="actor_rollout",
+        )
 
     def sync_rollout_weights(self):
         assert not self.hybrid_engine
@@ -429,7 +340,7 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         """
         batch = DataProto.from_single_dict(batch_dict)
         # pop those keys for generation
-        batch_keys_to_pop = [key for key in ["input_ids", "attention_mask", "position_ids"] if key in batch.batch.keys()]
+        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
         non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
         if "multi_modal_data" in batch.non_tensor_batch:
             non_tensor_batch_keys_to_pop.append("multi_modal_data")
@@ -441,21 +352,14 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
             non_tensor_batch_keys_to_pop.append("interaction_kwargs")
         gen_batch = batch.pop(
             batch_keys=batch_keys_to_pop,
-            non_tensor_batch_keys=[key for key in non_tensor_batch_keys_to_pop if key in batch.non_tensor_batch],
+            non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
         )
         gen_batch.meta_info["global_steps"] = self.global_steps
         # sync weights from actor to rollout
         if sync_before_generation:
             self.sync_rollout_weights()
-        if self.async_rollout_manager is not None:
-            gen_batch_output = LocalFutureWrapper(
-                self._async_rollout_executor.submit(
-                    lambda: asyncio.run(self.async_rollout_manager.generate_sequences_async(gen_batch))
-                )
-            )
-        else:
-            # Call non-blocking rollout (worker method registered with blocking=False)
-            gen_batch_output = self.rollout_wg.async_generate_sequences(gen_batch)
+        # Call non-blocking rollout (worker method registered with blocking=False)
+        gen_batch_output = self.rollout_wg.async_generate_sequences(gen_batch)
         return GenerationBatchFuture(epoch, batch, gen_batch_output)
 
     def _async_get_teacher_knowledge(self, future: GenerationBatchFuture):
@@ -477,64 +381,9 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         _, _, gen_batch_output = future.get()
         gen_batch_output.meta_info["response_length"] = self.config.data.max_response_length
 
-        teacher_futures = []
-        for spec in self.teacher_specs:
-            teacher_futures.append(
-                (
-                    spec,
-                    get_teacher_knowledge(
-                        gen_batch_output,
-                        spec["client"],
-                        spec["n_server_workers"],
-                        is_async=True,
-                    ),
-                )
-            )
-
-        def handle_teacher_futures():
-            output = None
-            timing = {}
-            teacher_outputs = []
-
-            for spec, teacher_future in teacher_futures:
-                teacher_output = teacher_future.get()
-                name = spec["name"]
-                teacher_outputs.append(teacher_output)
-
-                if output is None:
-                    output = DataProto.from_single_dict(data={"real_seq_lens": teacher_output.batch["real_seq_lens"]})
-
-                if self.teacher_aggregation == "weighted_loss":
-                    output.non_tensor_batch[f"{name}_topk_logps"] = teacher_output.non_tensor_batch[
-                        "teacher_topk_logps"
-                    ].copy()
-                    output.non_tensor_batch[f"{name}_topk_indices"] = teacher_output.non_tensor_batch[
-                        "teacher_topk_indices"
-                    ].copy()
-
-                teacher_timing = teacher_output.meta_info.get("timing", {})
-                get_teacher_time = teacher_timing.get("get_teacher_knowledge", 0)
-                timing[f"get_teacher_knowledge/{name}"] = get_teacher_time
-                timing["get_teacher_knowledge"] = timing.get("get_teacher_knowledge", 0) + get_teacher_time
-
-            assert output is not None, "No teacher outputs were collected."
-            if self.teacher_aggregation == "distribution_fusion":
-                output = fuse_teacher_knowledge(
-                    teacher_outputs,
-                    [spec["weight"] for spec in self.teacher_specs],
-                )
-                output.meta_info["teacher_names"] = ["fused_teacher"]
-                output.meta_info["teacher_weights"] = [1.0]
-                output.meta_info["teacher_fusion_source_names"] = [spec["name"] for spec in self.teacher_specs]
-                output.meta_info["teacher_fusion_source_weights"] = [spec["weight"] for spec in self.teacher_specs]
-            else:
-                output.meta_info["teacher_names"] = [spec["name"] for spec in self.teacher_specs]
-                output.meta_info["teacher_weights"] = [spec["weight"] for spec in self.teacher_specs]
-            output.meta_info["teacher_aggregation"] = self.teacher_aggregation
-            output.meta_info["timing"] = timing
-            return output
-
-        future.set_teacher_batch_output(SimpleNamespace(get=handle_teacher_futures))
+        future.set_teacher_batch_output(
+            get_teacher_knowledge(gen_batch_output, self.teacher_manager, self.n_server_workers, is_async=True)
+        )
         return future
 
     def one_step_off_scheduler(self, continuous_iterator):

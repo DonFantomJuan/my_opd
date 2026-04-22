@@ -278,37 +278,18 @@ actor_rollout_ref:
     #   ranks: []
 
   teacher:
-    # Backward compatible single-teacher defaults. Used when `teachers` is empty/null.
+    enabled: True
     server_ip: localhost
     server_port: 15555
     overlap_rollout: False
     n_server_workers: 1
-    # weighted_loss: compute each teacher KL separately, then sum weighted losses.
-    # distribution_fusion: union teacher top-k supports, fuse probabilities by weight,
-    # then compute one KL against the fused teacher distribution.
-    aggregation: weighted_loss
-    # Optional multi-teacher distillation. Each teacher service must expose the same
-    # ZeroMQ protocol as recipe/gkd/teacher and return top-k logprobs/indices.
-    # In weighted_loss mode, the actor optimizes sum_i weight_i * KL(teacher_i || student).
-    # In distribution_fusion mode, the actor optimizes KL(sum_i normalized_weight_i * teacher_i || student).
-    teachers: null
-    # Example:
-    # teachers:
-    #   - name: general
-    #     server_ip: 127.0.0.1
-    #     server_port: 15555
-    #     n_server_workers: 1
-    #     weight: 0.4
-    #   - name: medical
-    #     server_ip: 127.0.0.1
-    #     server_port: 15556
-    #     n_server_workers: 1
-    #     weight: 0.4
-    #   - name: pharmacy
-    #     server_ip: 127.0.0.1
-    #     server_port: 15557
-    #     n_server_workers: 1
-    #     weight: 0.2
+    multi_teacher:
+      enabled: False
+      mode: distribution_fusion # distribution_fusion or loss_fusion
+      normalize_weights: True
+      truncate_merged_topk: False
+      merged_topk: null
+      teachers: []
 
 trainer:
   balance_batch: True

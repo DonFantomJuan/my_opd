@@ -40,7 +40,6 @@ class _VocabParallelKLDivergence(torch.autograd.Function):
     def forward(ctx, vocab_parallel_logits, target_topk_logps, target_topk_indices):
         # seq_len, batch_size, top_k = target_topk_logps.size()
         # target_topk_logps = normalize(target_topk_logps)
-        vocab_parallel_logits = vocab_parallel_logits.clone()
         vocab_parallel_logits, logits_max = calculate_logits_max(vocab_parallel_logits)
         partition_vocab_size = vocab_parallel_logits.size(-1)
 

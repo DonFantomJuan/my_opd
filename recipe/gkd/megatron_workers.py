@@ -22,17 +22,15 @@ import time
 import numpy as np
 import psutil
 import torch
-import torch.distributed
 from codetiming import Timer
 from megatron.core import parallel_state as mpu
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron_kl_loss import vocab_parallel_kl_divergence
 from omegaconf import DictConfig, OmegaConf
 from torch import nn
 
-from recipe.gkd.megatron_kl_loss import vocab_parallel_kl_divergence
-from recipe.gkd.distributed_util import vllm_stateless_init_process_group
 from verl import DataProto
 from verl.single_controller.base.decorator import (
     Dispatch,
@@ -58,7 +56,6 @@ from verl.workers.megatron_workers import ActorRolloutRefWorker
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-device_name = get_device_name()
 
 
 class TensorBuffer:
@@ -197,6 +194,10 @@ class OnPolicyDistillActor:
             config.megatron.sequence_parallel = False
         self.config = config
 
+    @staticmethod
+    def _is_loss_fusion_batch(data: DataProto) -> bool:
+        return "multi_teacher_topk_logps" in data.non_tensor_batch
+
     def forward_backward_batch(
         self,
         data: DataProto,
@@ -218,22 +219,9 @@ class OnPolicyDistillActor:
         # )
         # split into micro-batches
         data.batch["attention_mask"] = data.batch["attention_mask"].to(bool)
-        teacher_names = data.meta_info.get("teacher_names", None)
-        if teacher_names is None:
-            teacher_names = ["teacher_0"] if "teacher_0_topk_logps" in data.non_tensor_batch else ["teacher"]
-        teacher_weights = [
-            float(weight) for weight in data.meta_info.get("teacher_weights", [1.0] * len(teacher_names))
-        ]
-        assert len(teacher_names) == len(teacher_weights), "teacher_names and teacher_weights must have same length"
-
-        def teacher_key(name, suffix):
-            if f"{name}_{suffix}" in data.non_tensor_batch:
-                return f"{name}_{suffix}"
-            if f"teacher_{suffix}" in data.non_tensor_batch:
-                return f"teacher_{suffix}"
-            return f"{name}_{suffix}"
 
         indices = None
+        is_loss_fusion = self._is_loss_fusion_batch(data)
         if use_dynamic_bsz:
             assert max_token_len is not None, "max_token_len must be set when use_dynamic_bsz is True"
             vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
@@ -252,10 +240,25 @@ class OnPolicyDistillActor:
                 micro_batches, indices = rearrange_micro_batches(batch=data.batch, max_token_len=max_token_len)
             # total_seqlen = max_token_len
             if mpu.is_pipeline_last_stage():
-                teacher_micro_batches = {}
-                for name in teacher_names:
-                    teacher_topk_logps_tensor = torch.tensor(data.non_tensor_batch[teacher_key(name, "topk_logps")])
-                    teacher_topk_indices_tensor = torch.tensor(data.non_tensor_batch[teacher_key(name, "topk_indices")])
+                if is_loss_fusion:
+                    multi_teacher_topk_logps_tensor = torch.tensor(data.non_tensor_batch["multi_teacher_topk_logps"])
+                    multi_teacher_topk_indices_tensor = torch.tensor(data.non_tensor_batch["multi_teacher_topk_indices"])
+                    multi_teacher_weights_tensor = torch.tensor(
+                        data.non_tensor_batch["multi_teacher_weights"], dtype=torch.float32
+                    )
+                    multi_teacher_topk_logps, multi_teacher_topk_indices = [], []
+                    for partition in indices:
+                        curr_logp_micro_batch, curr_idx_micro_batch = [], []
+                        for idx in partition:
+                            curr_logp_micro_batch.append(multi_teacher_topk_logps_tensor[:, idx : idx + 1])
+                            curr_idx_micro_batch.append(multi_teacher_topk_indices_tensor[:, idx : idx + 1])
+                        curr_logp_micro_batch = torch.cat(curr_logp_micro_batch, dim=1)
+                        curr_idx_micro_batch = torch.cat(curr_idx_micro_batch, dim=1)
+                        multi_teacher_topk_logps.append(curr_logp_micro_batch)
+                        multi_teacher_topk_indices.append(curr_idx_micro_batch)
+                else:
+                    teacher_topk_logps_tensor = torch.tensor(data.non_tensor_batch["teacher_topk_logps"])
+                    teacher_topk_indices_tensor = torch.tensor(data.non_tensor_batch["teacher_topk_indices"])
                     teacher_topk_logps, teacher_topk_indices = [], []
                     for partition in indices:
                         curr_logp_micro_batch, curr_idx_micro_batch = [], []
@@ -267,7 +270,6 @@ class OnPolicyDistillActor:
 
                         teacher_topk_logps.append(curr_logp_micro_batch)
                         teacher_topk_indices.append(curr_idx_micro_batch)
-                    teacher_micro_batches[name] = (teacher_topk_logps, teacher_topk_indices)
 
                 for i, mb in enumerate(micro_batches):
                     responses = mb["responses"]
@@ -276,10 +278,13 @@ class OnPolicyDistillActor:
                     calc_kl_mask[:, : (-response_length - 1)] = False
                     mb["calc_kl_mask"] = calc_kl_mask
                     mb["kl_losses"] = torch.zeros_like(calc_kl_mask, dtype=torch.float32)
-                    for name in teacher_names:
-                        teacher_topk_logps, teacher_topk_indices = teacher_micro_batches[name]
-                        mb[f"{name}_topk_logps"] = teacher_topk_logps[i].pin_memory()
-                        mb[f"{name}_topk_indices"] = teacher_topk_indices[i].pin_memory()
+                    if is_loss_fusion:
+                        mb["multi_teacher_topk_logps"] = multi_teacher_topk_logps[i].pin_memory()
+                        mb["multi_teacher_topk_indices"] = multi_teacher_topk_indices[i].pin_memory()
+                        mb["multi_teacher_weights"] = multi_teacher_weights_tensor.pin_memory()
+                    else:
+                        mb["teacher_topk_logps"] = teacher_topk_logps[i].pin_memory()
+                        mb["teacher_topk_indices"] = teacher_topk_indices[i].pin_memory()
         else:
             assert micro_batch_size is not None, (
                 "micro_batch_size is needed to be passed in when not using dynamic batch size"
@@ -288,16 +293,24 @@ class OnPolicyDistillActor:
             # seq_len = micro_batches[0]["input_ids"].shape[1]
             # total_seqlen = micro_batch_size * seq_len
             if mpu.is_pipeline_last_stage():
-                teacher_micro_batches = {}
-                for name in teacher_names:
-                    teacher_topk_logps = np.array_split(
-                        data.non_tensor_batch[teacher_key(name, "topk_logps")], len(micro_batches)
+                if is_loss_fusion:
+                    multi_teacher_topk_logps_tensor = torch.tensor(data.non_tensor_batch["multi_teacher_topk_logps"])
+                    multi_teacher_topk_indices_tensor = torch.tensor(data.non_tensor_batch["multi_teacher_topk_indices"])
+                    multi_teacher_weights_tensor = torch.tensor(
+                        data.non_tensor_batch["multi_teacher_weights"], dtype=torch.float32
                     )
+                    micro_batch_lengths = [mb["input_ids"].shape[0] for mb in micro_batches]
+                    multi_teacher_topk_logps = torch.split(
+                        multi_teacher_topk_logps_tensor, micro_batch_lengths, dim=1
+                    )
+                    multi_teacher_topk_indices = torch.split(
+                        multi_teacher_topk_indices_tensor, micro_batch_lengths, dim=1
+                    )
+                else:
+                    teacher_topk_logps = np.array_split(data.non_tensor_batch["teacher_topk_logps"], len(micro_batches))
                     teacher_topk_indices = np.array_split(
-                        data.non_tensor_batch[teacher_key(name, "topk_indices")], len(micro_batches)
+                        data.non_tensor_batch["teacher_topk_indices"], len(micro_batches)
                     )
-                    teacher_micro_batches[name] = (teacher_topk_logps, teacher_topk_indices)
-
                 for i, mb in enumerate(micro_batches):
                     responses = mb["responses"]
                     response_length = responses.size(1)
@@ -305,10 +318,13 @@ class OnPolicyDistillActor:
                     calc_kl_mask[:, : (-response_length - 1)] = False
                     mb["calc_kl_mask"] = calc_kl_mask
                     mb["kl_losses"] = torch.zeros_like(calc_kl_mask, dtype=torch.float32)
-                    for name in teacher_names:
-                        teacher_topk_logps, teacher_topk_indices = teacher_micro_batches[name]
-                        mb[f"{name}_topk_logps"] = torch.tensor(teacher_topk_logps[i]).pin_memory()
-                        mb[f"{name}_topk_indices"] = torch.tensor(teacher_topk_indices[i]).pin_memory()
+                    if is_loss_fusion:
+                        mb["multi_teacher_topk_logps"] = multi_teacher_topk_logps[i].pin_memory()
+                        mb["multi_teacher_topk_indices"] = multi_teacher_topk_indices[i].pin_memory()
+                        mb["multi_teacher_weights"] = multi_teacher_weights_tensor.pin_memory()
+                    else:
+                        mb["teacher_topk_logps"] = torch.tensor(teacher_topk_logps[i]).pin_memory()
+                        mb["teacher_topk_indices"] = torch.tensor(teacher_topk_indices[i]).pin_memory()
 
         # compute input shapes for pp stages
         n_micro_batch = len(micro_batches)
@@ -331,16 +347,6 @@ class OnPolicyDistillActor:
             masked_kl_lossed = kl_losses[calc_kl_mask]
             mean_kl_loss = masked_kl_lossed.mean()
             stats.update({"actor/kl_loss": mean_kl_loss.detach().item()})
-            for name, weight in zip(teacher_names, teacher_weights, strict=False):
-                teacher_loss_key = f"{name}_kl_losses"
-                if teacher_loss_key in output:
-                    mean_teacher_kl_loss = output[teacher_loss_key][calc_kl_mask].mean()
-                    stats.update(
-                        {
-                            f"actor/kl_loss/{name}": mean_teacher_kl_loss.detach().item(),
-                            f"actor/kl_loss_weight/{name}": weight,
-                        }
-                    )
 
             append_to_dict(metrics, stats)
             return mean_kl_loss, [metrics, ret_entropy]
@@ -351,27 +357,44 @@ class OnPolicyDistillActor:
             attention_mask = batch["attention_mask"]
             position_ids = batch["position_ids"]
 
-            def logits_processor(logits, calc_kl_mask, kl_losses, **teacher_knowledge):
+            def logits_processor(
+                logits,
+                calc_kl_mask,
+                kl_losses,
+                teacher_topk_logps=None,
+                teacher_topk_indices=None,
+                multi_teacher_topk_logps=None,
+                multi_teacher_topk_indices=None,
+                multi_teacher_weights=None,
+            ):
                 assert logits.shape[:2] == calc_kl_mask.shape[:2]
-
                 masked_logits = logits[calc_kl_mask]
-                output = {"kl_losses": kl_losses, "calc_kl_mask": calc_kl_mask}
-                for name, weight in zip(teacher_names, teacher_weights, strict=False):
-                    teacher_topk_logps = teacher_knowledge[f"{name}_topk_logps"]
-                    teacher_topk_indices = teacher_knowledge[f"{name}_topk_indices"]
+                if multi_teacher_topk_logps is not None:
+                    assert multi_teacher_topk_logps.dim() == 4
+                    assert multi_teacher_topk_indices.dim() == 4
+                    assert multi_teacher_topk_logps.shape[:3] == multi_teacher_topk_indices.shape[:3]
+                    assert logits.shape[:2] == multi_teacher_topk_logps.shape[1:3]
+                    fused_kl_loss = torch.zeros_like(kl_losses[calc_kl_mask], dtype=torch.float32)
+                    for teacher_idx in range(multi_teacher_topk_logps.size(0)):
+                        curr_teacher_topk_logps = multi_teacher_topk_logps[teacher_idx]
+                        curr_teacher_topk_indices = multi_teacher_topk_indices[teacher_idx]
+                        curr_kl_loss = vocab_parallel_kl_divergence(
+                            masked_logits,
+                            curr_teacher_topk_logps[calc_kl_mask],
+                            curr_teacher_topk_indices[calc_kl_mask],
+                        )
+                        fused_kl_loss = fused_kl_loss + multi_teacher_weights[teacher_idx] * curr_kl_loss
+                    kl_losses[calc_kl_mask] = fused_kl_loss
+                else:
+                    assert teacher_topk_indices is not None and teacher_topk_logps is not None
                     assert logits.shape[:2] == teacher_topk_indices.shape[:2]
                     assert logits.shape[:2] == teacher_topk_logps.shape[:2]
-
                     masked_teacher_topk_logps = teacher_topk_logps[calc_kl_mask]
                     masked_teacher_topk_indices = teacher_topk_indices[calc_kl_mask]
-                    teacher_kl_losses = torch.zeros_like(calc_kl_mask, dtype=torch.float32)
-                    teacher_loss_values = vocab_parallel_kl_divergence(
+                    kl_losses[calc_kl_mask] = vocab_parallel_kl_divergence(
                         masked_logits, masked_teacher_topk_logps, masked_teacher_topk_indices
                     )
-                    teacher_kl_losses[calc_kl_mask] = teacher_loss_values
-                    kl_losses[calc_kl_mask] = kl_losses[calc_kl_mask] + weight * teacher_loss_values
-                    output[f"{name}_kl_losses"] = teacher_kl_losses
-                return output
+                return {"kl_losses": kl_losses, "calc_kl_mask": calc_kl_mask}
 
             if mpu.is_pipeline_last_stage():
                 device = get_device_id()
@@ -379,12 +402,24 @@ class OnPolicyDistillActor:
                     "calc_kl_mask": batch["calc_kl_mask"],
                     "kl_losses": batch["kl_losses"],
                 }
-                for name in teacher_names:
-                    logits_processor_args[f"{name}_topk_logps"] = batch[f"{name}_topk_logps"].to(
-                        device, non_blocking=True
+                if "multi_teacher_topk_logps" in batch:
+                    logits_processor_args.update(
+                        {
+                            "multi_teacher_topk_logps": batch["multi_teacher_topk_logps"].to(
+                                device, non_blocking=True
+                            ),
+                            "multi_teacher_topk_indices": batch["multi_teacher_topk_indices"].to(
+                                device, non_blocking=True
+                            ),
+                            "multi_teacher_weights": batch["multi_teacher_weights"].to(device, non_blocking=True),
+                        }
                     )
-                    logits_processor_args[f"{name}_topk_indices"] = batch[f"{name}_topk_indices"].to(
-                        device, non_blocking=True
+                else:
+                    logits_processor_args.update(
+                        {
+                            "teacher_topk_logps": batch["teacher_topk_logps"].to(device, non_blocking=True),
+                            "teacher_topk_indices": batch["teacher_topk_indices"].to(device, non_blocking=True),
+                        }
                     )
             else:
                 logits_processor_args = None
@@ -511,7 +546,7 @@ class MegatronOnPolicyDistillActorWorker(ActorRolloutRefWorker):
             generator = self.bridge.export_weights(self.actor.actor_module)
         else:
             # from verl.utils.megatron_utils import per_tensor_generator
-            from recipe.gkd.megatron_utils import per_tensor_generator
+            from megatron_utils import per_tensor_generator
 
             from verl.models.mcore import get_mcore_weight_converter
 
@@ -618,33 +653,16 @@ class MegatronOnPolicyDistillActorWorker(ActorRolloutRefWorker):
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    def create_weight_sync_group(self, master_address, master_port, rank_offset, world_size):
-        rank = torch.distributed.get_rank() + rank_offset
-        self._weight_sync_group = vllm_stateless_init_process_group(
-            master_address,
-            master_port,
-            rank,
-            world_size,
-            get_torch_device().current_device(),
-        )
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def sync_rollout_weights(self):
         assert self._is_actor and not self.config.hybrid_engine
         assert hasattr(self, "_weights_info") and self._weights_info is not None
 
         params_generator = self._get_actor_params_generator()
 
+        from ray.util.collective import collective
+
         update_weights_bucket_bytes = int(self.config.rollout.update_weights_bucket_megabytes) << 20
         tensor_buffer = TensorBuffer(update_weights_bucket_bytes, self.param_dtype)
-
-        def broadcast_tensor(tensor):
-            if device_name == "npu":
-                self._weight_sync_group.broadcast(tensor, src=0, stream=get_torch_device().current_stream())
-            else:
-                from ray.util.collective import collective
-
-                collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
 
         for key, shape, dtype in self._weights_info:
             weight_key, weight = next(params_generator)
@@ -658,14 +676,14 @@ class MegatronOnPolicyDistillActorWorker(ActorRolloutRefWorker):
                 # weight = weight.to(dtype)
 
             if shape.numel() > tensor_buffer.capacity:
-                broadcast_tensor(weight)
+                collective.broadcast(weight, src_rank=0, group_name="actor_rollout")
             else:
                 if tensor_buffer.size + shape.numel() > tensor_buffer.capacity:
-                    broadcast_tensor(tensor_buffer.tensor)
+                    collective.broadcast(tensor_buffer.tensor, src_rank=0, group_name="actor_rollout")
                     tensor_buffer.clear()
                 tensor_buffer.append(key, shape, weight)
         if tensor_buffer.size > 0:
-            broadcast_tensor(tensor_buffer.tensor)
+            collective.broadcast(tensor_buffer.tensor, src_rank=0, group_name="actor_rollout")
             tensor_buffer.clear()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -820,36 +838,17 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
     def async_generate_sequences(self, *args, **kwargs):
         return self.generate_sequences(*args, **kwargs)
 
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
-    async def wake_up(self):
-        return True
-
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
-    async def sleep(self):
-        return True
-
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
-    def get_zeromq_address(self):
-        return self.rollout.get_zeromq_address()
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    def create_weight_sync_group(self, master_address, master_port, rank_offset, world_size):
-        rank = torch.distributed.get_rank() + rank_offset
-        self._weight_sync_group = vllm_stateless_init_process_group(
-            master_address,
-            master_port,
-            rank,
-            world_size,
-            get_torch_device().current_device(),
-        )
-
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def sync_rollout_weights(self):
+        from ray.util.collective import collective
+
         assert self._is_rollout and not self.config.hybrid_engine
         assert hasattr(self, "_weights_info") and self._weights_info is not None
         rollout_name = self.config.rollout.name
         if rollout_name == "vllm":
-            inference_model = self.rollout.inference_engine.worker.model_runner.model
+            inference_model = (
+                self.rollout.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+            )
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 
             patch_vllm_moe_model_weight_loader(inference_model)
@@ -880,29 +879,21 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
         update_weights_bucket_bytes = int(self.config.rollout.update_weights_bucket_megabytes) << 20
         tensor_buffer = TensorBuffer(update_weights_bucket_bytes, self.param_dtype)
 
-        def broadcast_tensor(tensor):
-            if device_name == "npu":
-                self._weight_sync_group.broadcast(tensor, src=0, stream=get_torch_device().current_stream())
-            else:
-                from ray.util.collective import collective
-
-                collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
-
         def group_tensor_generator():
             for key, shape, dtype in self._weights_info:
                 assert dtype == self.param_dtype, key
                 if shape.numel() > tensor_buffer.capacity:
                     tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
-                    broadcast_tensor(tensor)
+                    collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
                     yield [(key, tensor)]
                 else:
                     if tensor_buffer.size + shape.numel() > tensor_buffer.capacity:
-                        broadcast_tensor(tensor_buffer.tensor)
+                        collective.broadcast(tensor_buffer.tensor, src_rank=0, group_name="actor_rollout")
                         yield tensor_buffer.to_tensors()
                         tensor_buffer.clear()
                     tensor_buffer.append(key, shape)
             if tensor_buffer.size > 0:
-                broadcast_tensor(tensor_buffer.tensor)
+                collective.broadcast(tensor_buffer.tensor, src_rank=0, group_name="actor_rollout")
                 yield tensor_buffer.to_tensors()
                 tensor_buffer.clear()
 
