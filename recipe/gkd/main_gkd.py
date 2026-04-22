@@ -24,20 +24,18 @@ import ray
 from omegaconf import OmegaConf
 
 from recipe.gkd.ray_trainer import OnPolicyDistillTrainer
+from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 
-RAY_RUNTIME_ENV = {
-    "env_vars": {
-        "TOKENIZERS_PARALLELISM": "true",
-        "VLLM_LOGGING_LEVEL": "WARN",
-        "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "false",
-        "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        # To prevent hanging or crash during synchronization of weights between actor and rollout
-        # in disaggregated mode. See:
-        # https://docs.vllm.ai/en/latest/usage/troubleshooting.html?h=nccl_cumem_enable#known-issues
-        # https://github.com/vllm-project/vllm/blob/c6b0a7d3ba03ca414be1174e9bd86a97191b7090/vllm/worker/worker_base.py#L445
-        "NCCL_CUMEM_ENABLE": "0",
-    },
-}
+
+def _ensure_stable_cwd():
+    try:
+        os.getcwd()
+        return
+    except FileNotFoundError:
+        pass
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    os.chdir(repo_root)
 
 
 @hydra.main(config_path="config", config_name="on_policy_distill_trainer", version_base=None)
@@ -59,18 +57,20 @@ def run_on_policy_distill(config) -> None:
                 for distributed PPO training including Ray initialization settings,
                 model paths, and training hyperparameters.
     """
-    # Check if Ray is not initialized
-
+    _ensure_stable_cwd()
     if not ray.is_initialized():
-        # Initialize Ray with a local cluster configuration
-        # Set environment variables in the runtime environment to control tokenizer parallelism,
-        # NCCL debug level, VLLM logging level, and allow runtime LoRA updating
-        # `num_cpus` specifies the number of CPU cores Ray can use, obtained from the configuration
-        # PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_DEBUG"] = "INFO"
-        ray.init(
-            runtime_env=RAY_RUNTIME_ENV,
-            num_cpus=config.ray_init.num_cpus,
+        default_runtime_env = get_ppo_ray_runtime_env()
+        runtime_env = OmegaConf.merge(
+            OmegaConf.create(default_runtime_env),
+            OmegaConf.create(
+                {
+                    "env_vars": {
+                        "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "false",
+                    }
+                }
+            ),
         )
+        ray.init(runtime_env=OmegaConf.to_container(runtime_env, resolve=True), num_cpus=config.ray_init.num_cpus)
 
     # Create a remote instance of the TaskRunner class, and
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
@@ -119,6 +119,7 @@ class TaskRunner:
 
         from verl.utils.fs import copy_to_local
 
+        _ensure_stable_cwd()
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
 
         pprint(OmegaConf.to_container(config, resolve=True))
