@@ -44,6 +44,7 @@ from verl.utils.debug import marked_timer
 from verl.utils.metric import (
     reduce_metrics,
 )
+from verl.utils.device import get_nccl_backend
 from verl.utils.torch_dtypes import PrecisionType
 from verl.utils.tracking import ValidationGenerationsLogger
 
@@ -309,16 +310,39 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         self.actor_rollout_wg = self.actor_wg  # to be compatible with the functions that not be modified
         weights_info = self.actor_wg.get_actor_weights_info()[0]
         self.rollout_wg.set_actor_weights_info(weights_info)
+        self._create_weight_sync_group()
+
+    def _create_weight_sync_group(self):
         from ray.util.collective import collective
 
         actor_rollout_workers = self.actor_wg.workers + self.rollout_wg.workers
-        collective.create_collective_group(
-            actor_rollout_workers,
-            len(actor_rollout_workers),
-            list(range(0, len(actor_rollout_workers))),
-            backend="nccl",
-            group_name="actor_rollout",
-        )
+        n_workers = len(actor_rollout_workers)
+
+        if self.device_name == "npu":
+            master_address = ray.get(self.actor_wg.workers[0]._get_node_ip.remote())
+            master_port = ray.get(self.actor_wg.workers[0]._get_free_port.remote())
+            self.actor_wg.create_weight_sync_group(
+                master_address,
+                master_port,
+                0,
+                n_workers,
+            )
+            ray.get(
+                self.rollout_wg.create_weight_sync_group(
+                    master_address,
+                    master_port,
+                    len(self.actor_wg.workers),
+                    n_workers,
+                )
+            )
+        else:
+            collective.create_collective_group(
+                actor_rollout_workers,
+                n_workers,
+                list(range(0, n_workers)),
+                backend=get_nccl_backend(),
+                group_name="actor_rollout",
+            )
 
     def sync_rollout_weights(self):
         assert not self.hybrid_engine

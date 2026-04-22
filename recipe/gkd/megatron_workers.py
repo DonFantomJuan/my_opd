@@ -22,6 +22,7 @@ import time
 import numpy as np
 import psutil
 import torch
+import torch.distributed
 from codetiming import Timer
 from megatron.core import parallel_state as mpu
 from megatron.core.distributed import finalize_model_grads
@@ -31,6 +32,7 @@ from megatron_kl_loss import vocab_parallel_kl_divergence
 from omegaconf import DictConfig, OmegaConf
 from torch import nn
 
+from recipe.one_step_off_policy.distributed_util import vllm_stateless_init_process_group
 from verl import DataProto
 from verl.single_controller.base.decorator import (
     Dispatch,
@@ -56,6 +58,7 @@ from verl.workers.megatron_workers import ActorRolloutRefWorker
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+device_name = get_device_name()
 
 
 class TensorBuffer:
@@ -653,6 +656,17 @@ class MegatronOnPolicyDistillActorWorker(ActorRolloutRefWorker):
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def create_weight_sync_group(self, master_address, master_port, rank_offset, world_size):
+        rank = torch.distributed.get_rank() + rank_offset
+        self._weight_sync_group = vllm_stateless_init_process_group(
+            master_address,
+            master_port,
+            rank,
+            world_size,
+            get_torch_device().current_device(),
+        )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def sync_rollout_weights(self):
         assert self._is_actor and not self.config.hybrid_engine
         assert hasattr(self, "_weights_info") and self._weights_info is not None
@@ -676,14 +690,31 @@ class MegatronOnPolicyDistillActorWorker(ActorRolloutRefWorker):
                 # weight = weight.to(dtype)
 
             if shape.numel() > tensor_buffer.capacity:
-                collective.broadcast(weight, src_rank=0, group_name="actor_rollout")
+                if device_name == "npu":
+                    self._weight_sync_group.broadcast(weight, src=0, stream=get_torch_device().current_stream())
+                else:
+                    collective.broadcast(weight, src_rank=0, group_name="actor_rollout")
             else:
                 if tensor_buffer.size + shape.numel() > tensor_buffer.capacity:
-                    collective.broadcast(tensor_buffer.tensor, src_rank=0, group_name="actor_rollout")
+                    if device_name == "npu":
+                        self._weight_sync_group.broadcast(
+                            tensor_buffer.tensor,
+                            src=0,
+                            stream=get_torch_device().current_stream(),
+                        )
+                    else:
+                        collective.broadcast(tensor_buffer.tensor, src_rank=0, group_name="actor_rollout")
                     tensor_buffer.clear()
                 tensor_buffer.append(key, shape, weight)
         if tensor_buffer.size > 0:
-            collective.broadcast(tensor_buffer.tensor, src_rank=0, group_name="actor_rollout")
+            if device_name == "npu":
+                self._weight_sync_group.broadcast(
+                    tensor_buffer.tensor,
+                    src=0,
+                    stream=get_torch_device().current_stream(),
+                )
+            else:
+                collective.broadcast(tensor_buffer.tensor, src_rank=0, group_name="actor_rollout")
             tensor_buffer.clear()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -839,6 +870,17 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
         return self.generate_sequences(*args, **kwargs)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def create_weight_sync_group(self, master_address, master_port, rank_offset, world_size):
+        rank = torch.distributed.get_rank() + rank_offset
+        self._weight_sync_group = vllm_stateless_init_process_group(
+            master_address,
+            master_port,
+            rank,
+            world_size,
+            get_torch_device().current_device(),
+        )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def sync_rollout_weights(self):
         from ray.util.collective import collective
 
@@ -884,16 +926,33 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
                 assert dtype == self.param_dtype, key
                 if shape.numel() > tensor_buffer.capacity:
                     tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
-                    collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
+                    if device_name == "npu":
+                        self._weight_sync_group.broadcast(tensor, src=0, stream=get_torch_device().current_stream())
+                    else:
+                        collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
                     yield [(key, tensor)]
                 else:
                     if tensor_buffer.size + shape.numel() > tensor_buffer.capacity:
-                        collective.broadcast(tensor_buffer.tensor, src_rank=0, group_name="actor_rollout")
+                        if device_name == "npu":
+                            self._weight_sync_group.broadcast(
+                                tensor_buffer.tensor,
+                                src=0,
+                                stream=get_torch_device().current_stream(),
+                            )
+                        else:
+                            collective.broadcast(tensor_buffer.tensor, src_rank=0, group_name="actor_rollout")
                         yield tensor_buffer.to_tensors()
                         tensor_buffer.clear()
                     tensor_buffer.append(key, shape)
             if tensor_buffer.size > 0:
-                collective.broadcast(tensor_buffer.tensor, src_rank=0, group_name="actor_rollout")
+                if device_name == "npu":
+                    self._weight_sync_group.broadcast(
+                        tensor_buffer.tensor,
+                        src=0,
+                        stream=get_torch_device().current_stream(),
+                    )
+                else:
+                    collective.broadcast(tensor_buffer.tensor, src_rank=0, group_name="actor_rollout")
                 yield tensor_buffer.to_tensors()
                 tensor_buffer.clear()
 

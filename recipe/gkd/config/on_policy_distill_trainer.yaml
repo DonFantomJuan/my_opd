@@ -62,6 +62,9 @@ actor_rollout_ref:
     micro_batch_size: 2
     # Keep compatibility with legacy Megatron launch overrides used by the existing OPD scripts.
     ppo_mini_batch_size: ${actor_rollout_ref.actor.micro_batch_size}
+    ppo_micro_batch_size: null
+    ppo_micro_batch_size_per_gpu: ${actor_rollout_ref.actor.micro_batch_size}
+    ppo_infer_micro_batch_size_per_gpu: ${actor_rollout_ref.actor.micro_batch_size}
     megatron:
       param_offload: False
       grad_offload: False
@@ -118,8 +121,14 @@ actor_rollout_ref:
     use_dynamic_bsz: False
     max_token_len: 1024
     ppo_max_token_len_per_gpu: null
+    ppo_infer_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
     use_torch_compile: False
     shuffle: False
+    rollout_n: 1
+    router_replay:
+      mode: disabled
+      record_file: null
+      replay_file: null
     # profile the actor model in `update_policy` 
     profiler:
 
@@ -188,6 +197,7 @@ actor_rollout_ref:
     temperature: 1.0
     top_k: -1 # 0 for hf rollout, -1 for vllm rollout
     top_p: 1
+    n: 1
     data_parallel_size: 1
     expert_parallel_size: 1
     pipeline_model_parallel_size: 1
@@ -207,6 +217,8 @@ actor_rollout_ref:
     max_num_seqs: 1024
     disable_log_stats: True
     enable_chunked_prefill: False # could get higher throughput
+    log_prob_micro_batch_size: null
+    log_prob_micro_batch_size_per_gpu: null
     log_prob_use_dynamic_bsz: False
     log_prob_max_token_len_per_gpu: null
     # for hf rollout
